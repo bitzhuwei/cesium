@@ -13,16 +13,22 @@ define([
         '../Core/DeveloperError',
         '../Core/GeometryInstance',
         '../Core/getExtensionFromUri',
+        '../Core/getMagic',
+        '../Core/getStringFromTypedArray',
         '../Core/Intersect',
         '../Core/joinUrls',
+        '../Core/loadArrayBuffer',
         '../Core/Matrix3',
         '../Core/Matrix4',
         '../Core/OrientedBoundingBox',
         '../Core/Rectangle',
         '../Core/RectangleOutlineGeometry',
+        '../Core/Request',
         '../Core/RequestScheduler',
+        '../Core/RequestType',
         '../Core/SphereOutlineGeometry',
         '../ThirdParty/Uri',
+        '../ThirdParty/when',
         './Cesium3DTileChildrenVisibility',
         './Cesium3DTileContentFactory',
         './Cesium3DTileContentState',
@@ -35,7 +41,8 @@ define([
         './SceneMode',
         './TileBoundingRegion',
         './TileBoundingSphere',
-        './TileOrientedBoundingBox'
+        './TileOrientedBoundingBox',
+        './Tileset3DTileContent'
     ], function(
         BoundingSphere,
         BoxOutlineGeometry,
@@ -50,16 +57,22 @@ define([
         DeveloperError,
         GeometryInstance,
         getExtensionFromUri,
+        getMagic,
+        getStringFromTypedArray,
         Intersect,
         joinUrls,
+        loadArrayBuffer,
         Matrix3,
         Matrix4,
         OrientedBoundingBox,
         Rectangle,
         RectangleOutlineGeometry,
+        Request,
         RequestScheduler,
+        RequestType,
         SphereOutlineGeometry,
         Uri,
+        when,
         Cesium3DTileChildrenVisibility,
         Cesium3DTileContentFactory,
         Cesium3DTileContentState,
@@ -72,7 +85,8 @@ define([
         SceneMode,
         TileBoundingRegion,
         TileBoundingSphere,
-        TileOrientedBoundingBox) {
+        TileOrientedBoundingBox,
+        Tileset3DTileContent) {
     'use strict';
 
     /**
@@ -87,6 +101,7 @@ define([
      * @constructor
      */
     function Cesium3DTile(tileset, baseUrl, header, parent) {
+        this._tileset = tileset;
         this._header = header;
         var contentHeader = header.content;
 
@@ -187,46 +202,27 @@ define([
         this.parent = parent;
 
         var hasContent;
-        var hasTilesetContent;
         var requestServer;
-        var createContent;
+        var content;
+        var contentUrl;
+        var contentState;
 
         if (defined(contentHeader)) {
-            var contentUrl = contentHeader.url;
-            var url = joinUrls(baseUrl, contentUrl);
-            requestServer = RequestScheduler.getRequestServer(url);
-            var type = getExtensionFromUri(url);
-            var contentFactory = Cesium3DTileContentFactory[type];
-
-            if (type === 'json') {
-                hasContent = false;
-                hasTilesetContent = true;
-            } else {
-                hasContent = true;
-                hasTilesetContent = false;
-            }
-
-            //>>includeStart('debug', pragmas.debug);
-            if (!defined(contentFactory)) {
-                throw new DeveloperError('Unknown tile content type, ' + type + ', for ' + url);
-            }
-            //>>includeEnd('debug');
-
-            var that = this;
-            createContent = function() {
-                return contentFactory(tileset, that, url);
-            };
+            hasContent = true;
+            contentUrl = joinUrls(baseUrl, contentHeader.url);
+            requestServer = RequestScheduler.getRequestServer(contentUrl);
+            contentState = Cesium3DTileContentState.UNLOADED;
         } else {
             hasContent = false;
-            hasTilesetContent = false;
-
-            createContent = function() {
-                return new Empty3DTileContent();
-            };
+            content = new Empty3DTileContent();
+            contentState = Cesium3DTileContentState.LOADED;
         }
 
-        this._createContent = createContent;
-        this._content = createContent();
+        this._content = content;
+        this._contentUrl = contentUrl;
+        this._contentState = contentState;
+        this._contentReadyToProcessPromise = undefined;
+        this._contentReadyPromise = undefined;
 
         this._requestServer = requestServer;
 
@@ -251,7 +247,7 @@ define([
          *
          * @private
          */
-        this.hasTilesetContent = hasTilesetContent;
+        this.hasTilesetContent = false;
 
         /**
          * The corresponding node in the cache replacement list.
@@ -440,6 +436,44 @@ define([
             get : function() {
                 return this._content.state === Cesium3DTileContentState.UNLOADED;
             }
+        },
+
+        /**
+         * Gets the promise that will be resolved when the tile's content is ready to process.
+         * This happens after the content is downloaded but before the content is ready
+         * to render.
+         *
+         * The promise remains undefined until the tile's content is requested.
+         *
+         * @type {Promise.<Cesium3DTileContent>}
+         * @readonly
+         *
+         * @private
+         */
+        contentReadyToProcessPromise : {
+            get : function() {
+                if (defined(this._contentReadyToProcessPromise)) {
+                    return this._contentReadyToProcessPromise.promise;
+                }
+            }
+        },
+
+        /**
+         * Gets the promise that will be resolved when the tile's content is ready to render.
+         *
+         * The promise remains undefined until the tile's content is requested.
+         *
+         * @type {Promise.<Cesium3DTileContent>}
+         * @readonly
+         *
+         * @private
+         */
+        contentReadyPromise : {
+            get : function() {
+                if (defined(this._contentReadyPromise)) {
+                    return this._contentReadyPromise.promise;
+                }
+            }
         }
     });
 
@@ -452,7 +486,62 @@ define([
      * @private
      */
     Cesium3DTile.prototype.requestContent = function() {
-        this._content.request();
+        var that = this;
+
+        if (!this.hasContent) {
+            return false;
+        }
+
+        if (!this.canRequestContent()) {
+            return false;
+        }
+
+        var distance = this.distanceToCamera;
+        var promise = RequestScheduler.schedule(new Request({
+            url : this._contentUrl,
+            server : this._requestServer,
+            requestFunction : loadArrayBuffer,
+            type : RequestType.TILES3D,
+            distance : distance
+        }));
+
+        if (!defined(promise)) {
+            return false;
+        }
+
+        this._contentState = Cesium3DTileContentState.LOADING;
+        this._contentReadyToProcessPromise = when.defer();
+        this._contentReadyPromise = when.defer();
+
+        promise.then(function(arrayBuffer) {
+            if (that.isDestroyed()) {
+                return when.reject('tileset is destroyed');
+            }
+            var uint8Array = new Uint8Array(arrayBuffer);
+            var magic = getMagic(uint8Array);
+            var content = Cesium3DTileContentFactory[magic](that._tileset, that, that._contentUrl, arrayBuffer, 0);
+
+            if (!defined(content)) {
+                // The content may be json instead of one of the tile formats
+                content = new Tileset3DTileContent(that._tileset, that, that._contentUrl, arrayBuffer, 0);
+                that._hasTilesetContent = true;
+            }
+
+            that._content = content;
+            that._contentState = Cesium3DTileContentState.PROCESSING;
+            that._contentReadyToProcessPromise.resolve(content);
+
+            content.readyPromise.then(function(content) {
+                that._contentState = Cesium3DTileContentState.READY;
+                that._contentReadyPromise.resolve(content);
+            });
+        }).otherwise(function(error) {
+            that._contentState = Cesium3DTileContentState.FAILED;
+            that._contentReadyPromise.reject(error);
+            that._contentReadyToProcessPromise.reject(error);
+        });
+
+        return true;
     };
 
     /**

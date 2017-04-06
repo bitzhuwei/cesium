@@ -3,14 +3,12 @@ define([
         './Batched3DModel3DTileContent',
         './Composite3DTileContent',
         './Instanced3DModel3DTileContent',
-        './PointCloud3DTileContent',
-        './Tileset3DTileContent'
+        './PointCloud3DTileContent'
     ], function(
         Batched3DModel3DTileContent,
         Composite3DTileContent,
         Instanced3DModel3DTileContent,
-        PointCloud3DTileContent,
-        Tileset3DTileContent) {
+        PointCloud3DTileContent) {
     'use strict';
 
     /**
@@ -21,20 +19,17 @@ define([
      */
     var Cesium3DTileContentFactory = {
         b3dm : function(tileset, tile, url) {
-            return new Batched3DModel3DTileContent(tileset, tile, url);
+            return new Batched3DModel3DTileContent(tileset, tile, url, arrayBuffer, byteOffset);
         },
         pnts : function(tileset, tile, url) {
-            return new PointCloud3DTileContent(tileset, tile, url);
+            return new PointCloud3DTileContent(tileset, tile, url, arrayBuffer, byteOffset);
         },
         i3dm : function(tileset, tile, url) {
-            return new Instanced3DModel3DTileContent(tileset, tile, url);
+            return new Instanced3DModel3DTileContent(tileset, tile, url, arrayBuffer, byteOffset);
         },
         cmpt : function(tileset, tile, url) {
             // Send in the factory in order to avoid a cyclical dependency
-            return new Composite3DTileContent(tileset, tile, url, Cesium3DTileContentFactory);
-        },
-        json : function(tileset, tile, url) {
-            return new Tileset3DTileContent(tileset, tile, url);
+            return new Composite3DTileContent(tileset, tile, url, arrayBuffer, byteOffset, Cesium3DTileContentFactory);
         }
     };
 
